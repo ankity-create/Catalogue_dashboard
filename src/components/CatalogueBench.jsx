@@ -197,15 +197,176 @@ function csvEscape(v) {
   return /[",]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
+const EXPORT_COLS = [{ key: "id", label: "SKU ID" }, ...FIELDS.map((f) => ({ key: f.key, label: f.label }))];
+
 function buildCSV(products) {
-  const head = FIELDS.map((f) => f.key).join(",");
-  const rows = products.map((p) => FIELDS.map((f) => csvEscape(p.fields[f.key])).join(","));
-  return head + "\n" + rows.join("\n");
+  const head = EXPORT_COLS.map((c) => csvEscape(c.label)).join(",");
+  const rows = products.map((p) =>
+    EXPORT_COLS.map((c) => csvEscape(c.key === "id" ? p.id : p.fields[c.key])).join(",")
+  );
+  // Leading BOM so Excel opens UTF-8 (₹ and accents) correctly.
+  return "﻿" + head + "\n" + rows.join("\n");
 }
 
 function buildJSON(products) {
-  return JSON.stringify(products.map((p) => ({ id: p.id, ...p.fields })), null, 2);
+  return JSON.stringify(
+    {
+      exportedAt: new Date().toISOString(),
+      count: products.length,
+      products: products.map((p) => ({ id: p.id, createdAt: p.createdAt, ...p.fields })),
+    },
+    null,
+    2
+  );
 }
+
+/* ---------- data-dump parser ---------- */
+const LONG_KEYS = new Set(FIELDS.filter((f) => f.long).map((f) => f.key));
+
+// Label variants that can appear in raw pasted text / OCR output, per field key.
+const DUMP_ALIASES = {
+  brand: ["brand", "make", "manufacturer"],
+  product_name: ["product name", "product title", "item name", "title", "name", "product"],
+  category: ["product category", "category", "product type"],
+  subcategory: ["subcategory", "sub category"],
+  mrp_inr: ["maximum retail price", "mrp inr", "m r p", "mrp rs", "mrp", "price"],
+  country_of_origin: ["country of origin", "made in", "origin", "country"],
+  model_number: ["model number", "model no", "model code", "model"],
+  size: ["size"],
+  colour: ["colour", "color"],
+  dimensions_outer: ["outer dimensions", "dimensions outer", "outer size", "external dimensions", "overall dimensions", "dimensions", "dimension"],
+  dimensions_inner: ["inner dimensions", "dimensions inner", "inner size", "internal dimensions"],
+  capacity_size: ["capacity", "tonnage", "volume", "gross volume"],
+  power_wattage: ["power wattage", "power consumption", "input power", "power input", "rated power", "wattage", "power"],
+  energy_rating: ["energy rating", "star rating", "bee rating", "energy efficiency", "energy"],
+  weight: ["net weight", "gross weight", "product weight", "weight"],
+  key_features: ["key features", "special features", "highlights", "features"],
+  ideal_for: ["ideal for", "suitable for", "recommended for", "best for"],
+  how_to_use: ["how to use", "instructions", "directions", "usage"],
+  in_box_contents: ["what's in the box", "whats in the box", "in the box", "box contents", "package contents", "in box"],
+  // Kept deliberately specific: bare "about"/"details" match too much prose and misfire.
+  description: ["standard description", "product description", "about this item", "description", "overview"],
+  warranty_policy: ["warranty policy", "warranty period", "warranty"],
+  unboxing_requirement: ["unboxing requirement", "unboxing"],
+  replacement_policy: ["replacement policy", "replacement"],
+  return_policy: ["return policy", "returns", "return"],
+  unloading_responsibility: ["unloading responsibility", "unloading"],
+  installation_support: ["installation and technical support", "installation support", "installation", "technical support"],
+};
+
+const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Normalise a label to lowercase words, dropping units/punctuation/parentheticals to
+// spaces, e.g. "Dimensions (WxDxH) mm" -> "dimensions wxdxh mm", "Net Weight (Kg)" -> "net weight kg".
+const normLabel = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+// Normalised aliases, longest first so "internal dimensions" beats "dimensions" and
+// "model number" beats "model".
+const NORM_ALIASES = Object.entries(DUMP_ALIASES)
+  .flatMap(([key, aliases]) => aliases.map((a) => ({ key, alias: normLabel(a) })))
+  .sort((a, b) => b.alias.length - a.alias.length);
+
+// Map a raw label (the text before the delimiter) to a field key. Prefix match, so trailing
+// units/qualifiers ("Volume (L)", "Input Power (W)") still resolve to the right field.
+function aliasForLabel(rawLabel) {
+  const n = normLabel(rawLabel);
+  if (!n) return null;
+  for (const { key, alias } of NORM_ALIASES) {
+    if (n === alias || n.startsWith(alias + " ")) return key;
+  }
+  return null;
+}
+
+// Alias-anchored matcher for delimiter-less rows: OCR'd spec tables ("Brand      Voltas")
+// and bare headings ("Key Features"). Longest alias first.
+const SPACE_MATCHERS = Object.entries(DUMP_ALIASES)
+  .flatMap(([key, aliases]) => aliases.map((a) => ({ key, alias: a })))
+  .sort((a, b) => b.alias.length - a.alias.length)
+  .map(({ key, alias }) => {
+    const body = alias.split(" ").map(reEscape).join("[^a-z0-9]+");
+    const withValue = "^\\s*" + body + "(?:\\s*[-–—]\\s+|\\s{2,})(.+)$";
+    const alone = "^\\s*" + body + "\\s*[:=]?\\s*$";
+    return { key, re: new RegExp(withValue + "|" + alone, "i") };
+  });
+
+// Identify a line as a labelled field.
+//  - Strong delimiter (":", "=", tab): split on the FIRST one, then resolve the label. If the
+//    label doesn't map to any field it's still a labelled line -> {unknown} (a boundary), so
+//    unrelated specs are surfaced rather than swallowed into a neighbour.
+//  - Otherwise fall back to the alias-anchored space/dash/heading matcher.
+function matchDumpLabel(line) {
+  const strong = line.match(/^\s*(.{1,60}?)\s*[:=\t]\s*(.+?)\s*$/);
+  if (strong) {
+    const key = aliasForLabel(strong[1]);
+    return key ? { key, value: strong[2] } : { unknown: true };
+  }
+  for (const { key, re } of SPACE_MATCHERS) {
+    const m = line.match(re);
+    if (m) return { key, value: (m[1] || "").trim() };
+  }
+  return null;
+}
+
+// Parse a raw blob into { fields: {key: value}, unmatched: [lines] }.
+// Short fields take only their own line's value. Long fields (features, description, …)
+// capture following plain lines but stop at the next labelled line or a blank line. A leading
+// unlabelled paragraph becomes the description. Unknown labelled lines are surfaced, not merged.
+function parseDump(text) {
+  const lines = (text || "").split(/\r?\n/).map((l) => l.trim());
+  const fields = {};
+  const unmatched = [];
+  const leading = []; // prose before any structured/labelled line
+  let cur = null; // active long-field key, or null
+  let buf = [];
+  let structured = false;
+
+  const setField = (k, v) => {
+    const val = (v || "").trim();
+    if (val && !(k in fields)) fields[k] = val; // first non-empty value wins
+  };
+  const flushLong = () => {
+    if (cur) setField(cur, buf.join("\n").replace(/\n{3,}/g, "\n\n").trim());
+    cur = null;
+    buf = [];
+  };
+
+  for (const line of lines) {
+    if (!line) {
+      flushLong(); // a blank line ends a captured block
+      if (leading.length) structured = true; // leading paragraph is over
+      continue;
+    }
+    const m = matchDumpLabel(line);
+    if (m && !m.unknown) {
+      structured = true;
+      flushLong();
+      if (LONG_KEYS.has(m.key)) {
+        cur = m.key;
+        buf = m.value ? [m.value] : [];
+      } else {
+        setField(m.key, m.value); // short field: same line only, never absorbs
+      }
+      continue;
+    }
+    if (m || GENERIC_LABEL.test(line)) {
+      // A labelled line we don't map — a boundary, not content.
+      structured = true;
+      flushLong();
+      unmatched.push(line);
+      continue;
+    }
+    // plain prose line
+    if (cur) buf.push(line); // continuation of the active long field
+    else if (!structured) leading.push(line); // leading paragraph -> description later
+    else unmatched.push(line);
+  }
+  flushLong();
+  if (leading.length) setField("description", leading.join(" ").replace(/\s+/g, " ").trim());
+  return { fields, unmatched };
+}
+
+// Fallback boundary detector for very long labelled lines the strong matcher skips (>60 chars).
+const GENERIC_LABEL = /^\s*[A-Za-z][A-Za-z0-9 ()/&.'-]{0,58}?\s*[:=\t]\s*\S/;
 
 function completeness(p) {
   const filled = REQUIRED.filter((k) => (p.fields[k] || "").trim() !== "").length;
@@ -421,6 +582,138 @@ function ImagePanel({ product }) {
   );
 }
 
+const FIELD_LABEL = Object.fromEntries(FIELDS.map((f) => [f.key, f.label]));
+
+function DataDumpPanel({ product, onApply }) {
+  const [text, setText] = useState("");
+  const [overwrite, setOverwrite] = useState(false);
+  const [ocr, setOcr] = useState(null); // {status, pct, msg}
+  const [result, setResult] = useState(null); // {applied:[{key,value}], skipped:[...], unmatched:[...]}
+
+  const runOCR = async (files) => {
+    const imgs = [...files].filter((f) => f.type.startsWith("image/"));
+    if (!imgs.length) {
+      setOcr({ status: "error", msg: "No image found — drop a JPEG/PNG/WebP screenshot." });
+      return;
+    }
+    setOcr({ status: "loading", pct: 0 });
+    try {
+      const mod = await import("tesseract.js");
+      const recognize = mod.recognize || (mod.default && mod.default.recognize);
+      let combined = "";
+      for (const f of imgs) {
+        const url = await readAsDataURL(f);
+        const { data } = await recognize(url, "eng", {
+          logger: (m) => {
+            if (m.status === "recognizing text") setOcr({ status: "loading", pct: Math.round(m.progress * 100) });
+          },
+        });
+        combined += (combined ? "\n" : "") + (data.text || "");
+      }
+      setText((t) => (t ? t + "\n" : "") + combined);
+      setOcr({ status: "done" });
+    } catch (e) {
+      setOcr({ status: "error", msg: "Could not read the image on this device. " + (e.message || "") });
+    }
+  };
+
+  const readAndFill = () => {
+    const parsed = parseDump(text);
+    const applied = [];
+    const skipped = [];
+    const values = {};
+    for (const [key, value] of Object.entries(parsed.fields)) {
+      if (!(key in product.fields)) continue;
+      const isBlank = String(product.fields[key] || "").trim() === "";
+      if (isBlank || overwrite) {
+        values[key] = value;
+        applied.push({ key, value });
+      } else {
+        skipped.push({ key, value });
+      }
+    }
+    if (applied.length) onApply(values);
+    setResult({ applied, skipped, unmatched: parsed.unmatched });
+  };
+
+  const rowStyle = { fontSize: 12, padding: "3px 0", borderBottom: `1px solid ${T.line}`, display: "flex", gap: 8 };
+  const keyStyle = { fontFamily: T.mono, color: T.muted, minWidth: 150, flexShrink: 0 };
+
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: T.muted, marginBottom: 8 }}>
+        Paste raw product data (copied text, or lines like <code>Brand: Voltas</code>, <code>MRP: 45990</code>) — or drop
+        a screenshot to read it on this device. Recognised fields fill the blanks automatically.
+      </div>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder={"Brand: Voltas\nProduct name: 1.5 Ton 5 Star Split AC\nModel no: SAC 183V\nMRP: 45990\nCapacity: 1.5 Ton\nKey features:\n- Copper condenser\n- Turbo cooling"}
+        style={{ ...inputStyle, minHeight: 150, width: "100%" }}
+      />
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", margin: "10px 0" }}>
+        <label style={{ border: `1px solid ${T.line}`, borderRadius: 6, padding: "5px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+          + Screenshot (OCR)
+          <input type="file" accept="image/*" multiple style={{ display: "none" }}
+            onChange={(e) => { runOCR(e.target.files); e.target.value = ""; }} />
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: T.ink }}>
+          <input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} />
+          Overwrite fields that already have a value
+        </label>
+        {ocr?.status === "loading" && (
+          <span style={{ fontSize: 12, color: T.amber, fontFamily: T.mono }}>reading image… {ocr.pct}%</span>
+        )}
+        {ocr?.status === "error" && <span style={{ fontSize: 12, color: T.red }}>{ocr.msg}</span>}
+      </div>
+      <div
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => { e.preventDefault(); runOCR(e.dataTransfer.files); }}
+        style={{ border: `1.5px dashed ${T.line}`, borderRadius: 8, padding: 12, fontSize: 12, color: T.muted, fontFamily: T.mono, background: "#FCFDFB", marginBottom: 10 }}
+      >
+        …or drop a screenshot here. Images are read on your device — nothing is uploaded.
+      </div>
+      <Btn kind="primary" onClick={readAndFill} disabled={!text.trim()}>Read &amp; fill blanks</Btn>
+
+      {result && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>
+            Filled {result.applied.length} field{result.applied.length !== 1 ? "s" : ""}
+            {result.skipped.length ? ` · ${result.skipped.length} already set (skipped)` : ""}
+          </div>
+          {result.applied.map(({ key, value }) => (
+            <div key={key} style={rowStyle}>
+              <span style={{ ...keyStyle, color: T.leaf }}>{FIELD_LABEL[key] || key}</span>
+              <span style={{ wordBreak: "break-word", whiteSpace: "pre-wrap" }}>{value}</span>
+            </div>
+          ))}
+          {result.skipped.map(({ key, value }) => (
+            <div key={key} style={{ ...rowStyle, opacity: 0.55 }}>
+              <span style={keyStyle}>{FIELD_LABEL[key] || key}</span>
+              <span style={{ wordBreak: "break-word", whiteSpace: "pre-wrap" }}>{value}</span>
+            </div>
+          ))}
+          {result.applied.length === 0 && result.skipped.length === 0 && (
+            <div style={{ fontSize: 12, color: T.muted }}>
+              No known fields matched. Try labelling lines like <code>Brand:</code>, <code>Model no:</code>, <code>MRP:</code>.
+            </div>
+          )}
+          {result.unmatched.length > 0 && (
+            <details open style={{ marginTop: 8, fontSize: 12, color: T.muted }}>
+              <summary style={{ cursor: "pointer" }}>
+                {result.unmatched.length} line(s) not recognised — no matching field; copy into a field manually if needed
+              </summary>
+              <div style={{ fontFamily: T.mono, fontSize: 11, whiteSpace: "pre-wrap", marginTop: 4 }}>
+                {result.unmatched.join("\n")}
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function CatalogueBench() {
   const [products, setProducts] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -429,6 +722,7 @@ export default function CatalogueBench() {
   const [saveState, setSaveState] = useState("saved");
   const [exportModal, setExportModal] = useState(null);
   const [copied, setCopied] = useState(false);
+  const [dumpTarget, setDumpTarget] = useState(null);
   const saveTimer = useRef(null);
 
   const openExport = (kind) => {
@@ -480,6 +774,21 @@ export default function CatalogueBench() {
 
   const patch = (id, fn) => update(products.map((p) => (p.id === id ? fn(p) : p)));
 
+  const openDump = () => {
+    if (current) {
+      setDumpTarget(current.id);
+    } else {
+      const p = emptyProduct();
+      update([p, ...products]);
+      setSelected(p.id);
+      setDumpTarget(p.id);
+    }
+  };
+
+  const dumpProduct = products.find((p) => p.id === dumpTarget);
+  const applyDump = (values) =>
+    patch(dumpTarget, (p) => ({ ...p, fields: { ...p.fields, ...values } }));
+
   if (loading) return <div style={{ fontFamily: T.sans, padding: 40, color: T.muted }}>Loading your catalogue…</div>;
 
   return (
@@ -494,6 +803,7 @@ export default function CatalogueBench() {
           {saveState === "saving" ? "saving…" : saveState === "error" ? "save failed — retry by editing" : "saved"}
         </span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <Btn small onClick={openDump}>⤵ Data dump</Btn>
           <Btn small onClick={() => openExport("csv")} disabled={!products.length}>Export CSV</Btn>
           <Btn small onClick={() => openExport("json")} disabled={!products.length}>Export JSON</Btn>
           <Btn small kind="primary" onClick={addProduct}>+ New SKU</Btn>
@@ -576,6 +886,15 @@ export default function CatalogueBench() {
           )}
         </div>
       </div>
+
+      {dumpProduct && (
+        <Modal
+          title={"Data dump → " + (dumpProduct.fields.product_name || "new SKU")}
+          onClose={() => setDumpTarget(null)}
+        >
+          <DataDumpPanel key={dumpProduct.id} product={dumpProduct} onApply={applyDump} />
+        </Modal>
+      )}
 
       {exportModal && (
         <Modal title={"Export — " + exportModal.name} onClose={() => setExportModal(null)}>
