@@ -6,8 +6,9 @@ An e-commerce catalog management application built with React and Vite.
 
 - Product SKU Management
 - AI-Powered Standardization
+- Data Dump — paste raw text or drop a screenshot to auto-fill blank fields (on-device OCR, nothing uploaded)
 - Image Processing
-- Export Capabilities
+- Export Capabilities (CSV with labelled headers + Excel-friendly encoding, structured JSON)
 - Local Storage
 
 ## Getting Started
