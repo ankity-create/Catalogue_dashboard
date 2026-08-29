@@ -234,10 +234,10 @@ const DUMP_ALIASES = {
   model_number: ["model number", "model no", "model code", "model"],
   size: ["size"],
   colour: ["colour", "color"],
-  dimensions_outer: ["outer dimensions", "dimensions outer", "outer size", "external dimensions"],
+  dimensions_outer: ["outer dimensions", "dimensions outer", "outer size", "external dimensions", "overall dimensions", "dimensions", "dimension"],
   dimensions_inner: ["inner dimensions", "dimensions inner", "inner size", "internal dimensions"],
-  capacity_size: ["capacity", "tonnage", "volume"],
-  power_wattage: ["power wattage", "power consumption", "wattage", "power"],
+  capacity_size: ["capacity", "tonnage", "volume", "gross volume"],
+  power_wattage: ["power wattage", "power consumption", "input power", "power input", "rated power", "wattage", "power"],
   energy_rating: ["energy rating", "star rating", "bee rating", "energy efficiency", "energy"],
   weight: ["net weight", "gross weight", "product weight", "weight"],
   key_features: ["key features", "special features", "highlights", "features"],
@@ -256,46 +256,69 @@ const DUMP_ALIASES = {
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Per-alias matcher. A label is recognised when the line either (a) starts with the
-// alias followed by a delimiter (":", "=", tab, a spaced "-", or 2+ spaces) and a value,
-// or (b) is exactly the alias on its own (a heading). Longest alias first so
-// "model number" wins over "model". Delimiters allowing 2+ spaces help OCR'd spec tables
-// like "Brand      Voltas".
-const DUMP_MATCHERS = Object.entries(DUMP_ALIASES)
-  .flatMap(([key, aliases]) => aliases.map((a) => ({ key, alias: a })))
-  .sort((a, b) => b.alias.length - a.alias.length)
-  .map(({ key, alias }) => {
-    const body = alias.split(" ").map(reEscape).join("[^a-z0-9]+");
-    const withValue = "^\\s*" + body + "(?:\\s*[:=\\t]+\\s*|\\s*[-–—]\\s+|\\s{2,})(.+)$";
-    const alone = "^\\s*" + body + "\\s*[:=]?\\s*$";
-    return { key, re: new RegExp(withValue + "|" + alone, "i") };
-  });
+// Normalise a label to lowercase words, dropping units/punctuation/parentheticals to
+// spaces, e.g. "Dimensions (WxDxH) mm" -> "dimensions wxdxh mm", "Net Weight (Kg)" -> "net weight kg".
+const normLabel = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
-function matchDumpLabel(line) {
-  for (const { key, re } of DUMP_MATCHERS) {
-    const m = line.match(re);
-    // m[1] is the same-line value; undefined when the line is a bare heading.
-    if (m) return { key, value: (m[1] || "").trim(), heading: m[1] === undefined };
+// Normalised aliases, longest first so "internal dimensions" beats "dimensions" and
+// "model number" beats "model".
+const NORM_ALIASES = Object.entries(DUMP_ALIASES)
+  .flatMap(([key, aliases]) => aliases.map((a) => ({ key, alias: normLabel(a) })))
+  .sort((a, b) => b.alias.length - a.alias.length);
+
+// Map a raw label (the text before the delimiter) to a field key. Prefix match, so trailing
+// units/qualifiers ("Volume (L)", "Input Power (W)") still resolve to the right field.
+function aliasForLabel(rawLabel) {
+  const n = normLabel(rawLabel);
+  if (!n) return null;
+  for (const { key, alias } of NORM_ALIASES) {
+    if (n === alias || n.startsWith(alias + " ")) return key;
   }
   return null;
 }
 
-// Any "Label: value" / "Label = value" / "Label<tab>value" line, recognised or not.
-// Used to STOP multi-line capture at the next field boundary, so an unknown label never
-// gets swallowed into the previous field. Dash and multi-space are excluded here — too
-// common inside prose to treat as a generic boundary.
-const GENERIC_LABEL = /^\s*[A-Za-z][A-Za-z0-9 ()/&.'-]{0,38}?\s*[:=\t]\s*\S/;
+// Alias-anchored matcher for delimiter-less rows: OCR'd spec tables ("Brand      Voltas")
+// and bare headings ("Key Features"). Longest alias first.
+const SPACE_MATCHERS = Object.entries(DUMP_ALIASES)
+  .flatMap(([key, aliases]) => aliases.map((a) => ({ key, alias: a })))
+  .sort((a, b) => b.alias.length - a.alias.length)
+  .map(({ key, alias }) => {
+    const body = alias.split(" ").map(reEscape).join("[^a-z0-9]+");
+    const withValue = "^\\s*" + body + "(?:\\s*[-–—]\\s+|\\s{2,})(.+)$";
+    const alone = "^\\s*" + body + "\\s*[:=]?\\s*$";
+    return { key, re: new RegExp(withValue + "|" + alone, "i") };
+  });
+
+// Identify a line as a labelled field.
+//  - Strong delimiter (":", "=", tab): split on the FIRST one, then resolve the label. If the
+//    label doesn't map to any field it's still a labelled line -> {unknown} (a boundary), so
+//    unrelated specs are surfaced rather than swallowed into a neighbour.
+//  - Otherwise fall back to the alias-anchored space/dash/heading matcher.
+function matchDumpLabel(line) {
+  const strong = line.match(/^\s*(.{1,60}?)\s*[:=\t]\s*(.+?)\s*$/);
+  if (strong) {
+    const key = aliasForLabel(strong[1]);
+    return key ? { key, value: strong[2] } : { unknown: true };
+  }
+  for (const { key, re } of SPACE_MATCHERS) {
+    const m = line.match(re);
+    if (m) return { key, value: (m[1] || "").trim() };
+  }
+  return null;
+}
 
 // Parse a raw blob into { fields: {key: value}, unmatched: [lines] }.
 // Short fields take only their own line's value. Long fields (features, description, …)
-// capture following plain lines but stop at the next label-looking line or a blank line,
-// so fields are never merged and unknown labels are surfaced instead of absorbed.
+// capture following plain lines but stop at the next labelled line or a blank line. A leading
+// unlabelled paragraph becomes the description. Unknown labelled lines are surfaced, not merged.
 function parseDump(text) {
   const lines = (text || "").split(/\r?\n/).map((l) => l.trim());
   const fields = {};
   const unmatched = [];
+  const leading = []; // prose before any structured/labelled line
   let cur = null; // active long-field key, or null
   let buf = [];
+  let structured = false;
 
   const setField = (k, v) => {
     const val = (v || "").trim();
@@ -310,10 +333,12 @@ function parseDump(text) {
   for (const line of lines) {
     if (!line) {
       flushLong(); // a blank line ends a captured block
+      if (leading.length) structured = true; // leading paragraph is over
       continue;
     }
     const m = matchDumpLabel(line);
-    if (m) {
+    if (m && !m.unknown) {
+      structured = true;
       flushLong();
       if (LONG_KEYS.has(m.key)) {
         cur = m.key;
@@ -323,18 +348,25 @@ function parseDump(text) {
       }
       continue;
     }
-    if (GENERIC_LABEL.test(line)) {
-      // Some other labelled line we don't map — a boundary, not content.
+    if (m || GENERIC_LABEL.test(line)) {
+      // A labelled line we don't map — a boundary, not content.
+      structured = true;
       flushLong();
       unmatched.push(line);
       continue;
     }
+    // plain prose line
     if (cur) buf.push(line); // continuation of the active long field
+    else if (!structured) leading.push(line); // leading paragraph -> description later
     else unmatched.push(line);
   }
   flushLong();
+  if (leading.length) setField("description", leading.join(" ").replace(/\s+/g, " ").trim());
   return { fields, unmatched };
 }
+
+// Fallback boundary detector for very long labelled lines the strong matcher skips (>60 chars).
+const GENERIC_LABEL = /^\s*[A-Za-z][A-Za-z0-9 ()/&.'-]{0,58}?\s*[:=\t]\s*\S/;
 
 function completeness(p) {
   const filled = REQUIRED.filter((k) => (p.fields[k] || "").trim() !== "").length;
@@ -667,8 +699,10 @@ function DataDumpPanel({ product, onApply }) {
             </div>
           )}
           {result.unmatched.length > 0 && (
-            <details style={{ marginTop: 8, fontSize: 12, color: T.muted }}>
-              <summary style={{ cursor: "pointer" }}>{result.unmatched.length} line(s) not recognised</summary>
+            <details open style={{ marginTop: 8, fontSize: 12, color: T.muted }}>
+              <summary style={{ cursor: "pointer" }}>
+                {result.unmatched.length} line(s) not recognised — no matching field; copy into a field manually if needed
+              </summary>
               <div style={{ fontFamily: T.mono, fontSize: 11, whiteSpace: "pre-wrap", marginTop: 4 }}>
                 {result.unmatched.join("\n")}
               </div>
