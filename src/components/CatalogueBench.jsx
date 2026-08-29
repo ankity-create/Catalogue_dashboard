@@ -244,8 +244,9 @@ const DUMP_ALIASES = {
   ideal_for: ["ideal for", "suitable for", "recommended for", "best for"],
   how_to_use: ["how to use", "instructions", "directions", "usage"],
   in_box_contents: ["what's in the box", "whats in the box", "in the box", "box contents", "package contents", "in box"],
-  description: ["standard description", "product description", "about this item", "description", "overview", "about", "details"],
-  warranty_policy: ["warranty policy", "warranty"],
+  // Kept deliberately specific: bare "about"/"details" match too much prose and misfire.
+  description: ["standard description", "product description", "about this item", "description", "overview"],
+  warranty_policy: ["warranty policy", "warranty period", "warranty"],
   unboxing_requirement: ["unboxing requirement", "unboxing"],
   replacement_policy: ["replacement policy", "replacement"],
   return_policy: ["return policy", "returns", "return"],
@@ -255,61 +256,83 @@ const DUMP_ALIASES = {
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Build [regex, fieldKey] pairs, longest alias first so "model number" beats "model".
+// Per-alias matcher. A label is recognised when the line either (a) starts with the
+// alias followed by a delimiter (":", "=", tab, a spaced "-", or 2+ spaces) and a value,
+// or (b) is exactly the alias on its own (a heading). Longest alias first so
+// "model number" wins over "model". Delimiters allowing 2+ spaces help OCR'd spec tables
+// like "Brand      Voltas".
 const DUMP_MATCHERS = Object.entries(DUMP_ALIASES)
   .flatMap(([key, aliases]) => aliases.map((a) => ({ key, alias: a })))
   .sort((a, b) => b.alias.length - a.alias.length)
   .map(({ key, alias }) => {
     const body = alias.split(" ").map(reEscape).join("[^a-z0-9]+");
-    // Label, then either a delimiter + value on the same line, or nothing (value follows on next lines).
-    return { key, re: new RegExp("^\\s*" + body + "\\s*(?:[:=\\-–—\\t]+\\s*(.*))?$", "i") };
+    const withValue = "^\\s*" + body + "(?:\\s*[:=\\t]+\\s*|\\s*[-–—]\\s+|\\s{2,})(.+)$";
+    const alone = "^\\s*" + body + "\\s*[:=]?\\s*$";
+    return { key, re: new RegExp(withValue + "|" + alone, "i") };
   });
 
 function matchDumpLabel(line) {
   for (const { key, re } of DUMP_MATCHERS) {
     const m = line.match(re);
-    if (m) return { key, value: (m[1] || "").trim() };
+    // m[1] is the same-line value; undefined when the line is a bare heading.
+    if (m) return { key, value: (m[1] || "").trim(), heading: m[1] === undefined };
   }
   return null;
 }
 
+// Any "Label: value" / "Label = value" / "Label<tab>value" line, recognised or not.
+// Used to STOP multi-line capture at the next field boundary, so an unknown label never
+// gets swallowed into the previous field. Dash and multi-space are excluded here — too
+// common inside prose to treat as a generic boundary.
+const GENERIC_LABEL = /^\s*[A-Za-z][A-Za-z0-9 ()/&.'-]{0,38}?\s*[:=\t]\s*\S/;
+
 // Parse a raw blob into { fields: {key: value}, unmatched: [lines] }.
-// Multi-line values (e.g. features, description) are captured until the next recognised label.
+// Short fields take only their own line's value. Long fields (features, description, …)
+// capture following plain lines but stop at the next label-looking line or a blank line,
+// so fields are never merged and unknown labels are surfaced instead of absorbed.
 function parseDump(text) {
   const lines = (text || "").split(/\r?\n/).map((l) => l.trim());
   const fields = {};
   const unmatched = [];
-  let cur = null;
+  let cur = null; // active long-field key, or null
   let buf = [];
 
-  const flush = () => {
-    if (cur) {
-      const joined = LONG_KEYS.has(cur)
-        ? buf.join("\n").replace(/\n{3,}/g, "\n\n").trim()
-        : buf.join(" ").replace(/\s+/g, " ").trim();
-      if (joined) fields[cur] = joined;
-    }
+  const setField = (k, v) => {
+    const val = (v || "").trim();
+    if (val && !(k in fields)) fields[k] = val; // first non-empty value wins
+  };
+  const flushLong = () => {
+    if (cur) setField(cur, buf.join("\n").replace(/\n{3,}/g, "\n\n").trim());
     cur = null;
     buf = [];
   };
 
   for (const line of lines) {
     if (!line) {
-      if (cur) buf.push("");
+      flushLong(); // a blank line ends a captured block
       continue;
     }
     const m = matchDumpLabel(line);
     if (m) {
-      flush();
-      cur = m.key;
-      buf = m.value ? [m.value] : [];
-    } else if (cur) {
-      buf.push(line);
-    } else {
-      unmatched.push(line);
+      flushLong();
+      if (LONG_KEYS.has(m.key)) {
+        cur = m.key;
+        buf = m.value ? [m.value] : [];
+      } else {
+        setField(m.key, m.value); // short field: same line only, never absorbs
+      }
+      continue;
     }
+    if (GENERIC_LABEL.test(line)) {
+      // Some other labelled line we don't map — a boundary, not content.
+      flushLong();
+      unmatched.push(line);
+      continue;
+    }
+    if (cur) buf.push(line); // continuation of the active long field
+    else unmatched.push(line);
   }
-  flush();
+  flushLong();
   return { fields, unmatched };
 }
 
